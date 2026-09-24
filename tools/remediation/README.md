@@ -22,6 +22,9 @@ support chat completions. Each Jev call costs about $0.00004; a Claude analysis 
 Renovate won't overwrite the fix: it stops updating a branch once someone else has committed
 to it, and `rebaseWhen: conflicted` stops routine rebases.
 
+Mend's SCA and SAST checks are turned off for this repo in `.whitesource`; they aren't part of
+this demo.
+
 ## Setup (one time)
 
 Repository secrets (Settings → Secrets and variables → Actions):
@@ -35,11 +38,12 @@ Repository secrets (Settings → Secrets and variables → Actions):
 ## Demo walkthrough
 
 1. **Baseline is green.** The `CI` workflow passes on `poc-baseline` (556 tests).
-2. **Renovate opens the PR.** Run Renovate (Node 24 required):
-   ```sh
-   RENOVATE_TOKEN=$(gh auth token) npx -y -p node@24 -p renovate@44 -- renovate <owner>/fastapi-users
-   ```
-   It opens `chore(deps): update dependency httpx to v0.28.1` from `renovate/httpx-0.x`.
+2. **Renovate opens the PR.** In the Mend developer portal (https://developer.mend.io), open this
+   repository and run a Renovate job. The hosted Renovate app opens *Update dependency httpx
+   to v0.28.1* from `renovate/httpx-0.x`, authored by `renovate[bot]`.
+   To reset the demo, close the PR and delete its branch; `recreateWhen: always` lets the next
+   run open it again. (Fallback without the app, Node 24 required; the PR is then authored by
+   the token's user: `RENOVATE_TOKEN=$(gh auth token) npx -y -p node@24 -p renovate@44 -- renovate <owner>/fastapi-users`.)
 3. **CI fails** with `TypeError: AsyncClient.__init__() got an unexpected keyword argument 'app'`.
 4. **Remediate.** Either:
    - GitHub: Actions → *Remediate dependency PR* → Run workflow → PR number, or
