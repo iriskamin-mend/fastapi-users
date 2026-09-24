@@ -36,9 +36,15 @@ MAX_LOG_CHARS = 12_000
 MAX_NOTES_CHARS = 8_000
 MAX_DIFF_CHARS = 6_000
 COMMENT_MARKER = "<!-- agentic-remediation -->"
-# Renovate Merge Confidence levels, lowest to highest. Renovate adds them to the PR as
-# "merge-confidence:<level>" labels (packageRules with matchConfidence in renovate.json).
+# Renovate Merge Confidence levels, lowest to highest.
 MERGE_CONFIDENCE_LEVELS = ["low", "neutral", "high", "very high"]
+# Renovate's PR description links a Merge Confidence badge for each update. The level is only
+# published as that badge image (the Merge Confidence API needs a private-beta Mend key), so
+# the badge is recognised by its image fingerprint, or failing that its width. Anything else,
+# including "very high" (not yet observed), is reported as unknown and fails the gate.
+MC_BADGE_RE = re.compile(r"https://developer\.mend\.io/api/mc/badges/confidence/[^\s)\"'?]+")
+MC_BADGE_FINGERPRINTS = {"01ee9156838c": "low", "17f77ec872a0": "neutral", "7d1cb9b232f8": "high"}
+MC_BADGE_WIDTHS = {"49.9": "low", "70.4": "neutral", "55.1": "high"}
 
 
 # --------------------------------------------------------------------------- utils
@@ -169,6 +175,7 @@ class Context:
     bumps: list[Bump] = field(default_factory=list)
     release_notes: str = ""
     merge_confidence: Optional[str] = None  # Renovate Merge Confidence level, if known
+    merge_confidence_badges: list[str] = field(default_factory=list)
 
 
 REQ_LINE = re.compile(r"^([+-])\s*([A-Za-z0-9_.\-\[\]]+)==([^\s;#]+)", re.M)
@@ -276,13 +283,30 @@ def ci_failure_log(repo: str, branch: str) -> Optional[tuple[str, str]]:
     return f"GitHub Actions run {run_id}", extract_pytest_failure("\n".join(lines))
 
 
-def merge_confidence_from_labels(labels: list[str]) -> Optional[str]:
-    for label in labels:
-        if label.startswith("merge-confidence:"):
-            level = label.split(":", 1)[1].replace("-", " ").strip().lower()
-            if level in MERGE_CONFIDENCE_LEVELS:
-                return level
-    return None
+def merge_confidence_from_badge(url: str) -> Optional[str]:
+    import base64
+    import hashlib
+
+    try:
+        svg = urllib.request.urlopen(f"{url}?slim=true", timeout=30).read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        log(f"could not fetch Merge Confidence badge {url}: {e}")
+        return None
+    png = re.search(r"base64,([^\"]+)", svg)
+    if png:
+        fingerprint = hashlib.sha256(base64.b64decode(png.group(1))).hexdigest()[:12]
+        if fingerprint in MC_BADGE_FINGERPRINTS:
+            return MC_BADGE_FINGERPRINTS[fingerprint]
+    width = re.search(r'<svg width="([\d.]+)"', svg)
+    return MC_BADGE_WIDTHS.get(width.group(1)) if width else None
+
+
+def lowest_merge_confidence(urls: list[str]) -> Optional[str]:
+    """Lowest level across all updated packages; unknown if any badge can't be read."""
+    levels = [merge_confidence_from_badge(u) for u in urls]
+    if not levels or None in levels:
+        return None
+    return min(levels, key=MERGE_CONFIDENCE_LEVELS.index)
 
 
 def merge_confidence_ok(level: Optional[str], minimum: str) -> bool:
@@ -293,14 +317,14 @@ def collect_context(args: argparse.Namespace) -> Context:
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     if args.pr:
         info = json.loads(
-            run(["gh", "pr", "view", str(args.pr), "-R", args.repo, "--json", "headRefName,baseRefName,labels"]).stdout
+            run(["gh", "pr", "view", str(args.pr), "-R", args.repo, "--json", "headRefName,baseRefName,body"]).stdout
         )
         branch = info["headRefName"]
-        labels = [lb["name"] for lb in info.get("labels", [])]
+        badges = list(dict.fromkeys(MC_BADGE_RE.findall(info.get("body") or "")))
         diff = run(["gh", "pr", "diff", str(args.pr), "-R", args.repo]).stdout
     else:
         diff = run(["git", "diff", f"{args.base}...HEAD"]).stdout
-        labels = []
+        badges = []
 
     failure_log, source = None, ""
     if args.log_file:
@@ -318,7 +342,11 @@ def collect_context(args: argparse.Namespace) -> Context:
 
     ctx = Context(args.repo, args.pr, branch, diff, clip(failure_log, MAX_LOG_CHARS), source)
     ctx.bumps = parse_bumps(diff)
-    ctx.merge_confidence = args.merge_confidence or merge_confidence_from_labels(labels)
+    if not badges:  # local run without a PR: same badge Renovate would link (PyPI packages)
+        badges = [f"https://developer.mend.io/api/mc/badges/confidence/pypi/{b.package}/{b.old}/{b.new}"
+                  for b in ctx.bumps]
+    ctx.merge_confidence_badges = badges
+    ctx.merge_confidence = args.merge_confidence or lowest_merge_confidence(badges)
     ctx.release_notes = clip(
         "\n\n".join(fetch_release_notes(b) for b in ctx.bumps) or "(no dependency bumps detected in diff)",
         MAX_NOTES_CHARS,
@@ -663,7 +691,7 @@ def main() -> int:
     ap.add_argument("--min-merge-confidence", default="high", choices=MERGE_CONFIDENCE_LEVELS,
                     help="lowest Renovate Merge Confidence level at which the fix is applied")
     ap.add_argument("--merge-confidence", choices=MERGE_CONFIDENCE_LEVELS,
-                    help="use this level instead of the PR's merge-confidence label (e.g. local runs)")
+                    help="use this level instead of reading Renovate's Merge Confidence badge")
     ap.add_argument("--dry-run", action="store_true", help="don't commit, push, or comment")
     ap.add_argument("--report", default="remediation-report.md")
     ap.add_argument("--trace", default="remediation-trace.json", help="step-by-step trace output")
@@ -693,6 +721,7 @@ def remediate(args: argparse.Namespace) -> str:
             dependency_change=bumps_text(ctx),
             release_notes_source=ctx.release_notes.splitlines()[0] if ctx.release_notes else "",
             merge_confidence=ctx.merge_confidence,
+            merge_confidence_badges=ctx.merge_confidence_badges,
             decision=f"{bumps_text(ctx)}; log from {ctx.log_source}",
         )
     log(f"branch={ctx.branch} bumps={bumps_text(ctx)} log={ctx.log_source}")

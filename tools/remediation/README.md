@@ -16,7 +16,7 @@ When a Renovate dependency update breaks the tests, an AI agent works out why, f
 | 2 | Classify the failure as `API_BREAK` or `OTHER`, with a confidence score | Jev (`typesafe/jev-1.13` via OpenRouter) |
 | 3 | Explain the root cause and propose the code change | Claude (Sonnet, via Claude Code) |
 | 4 | Decide whether the proposed change fixes the failure (`is_fixable`), with a confidence score | Jev |
-| 5 | Check Renovate's Merge Confidence for the update | Script (from Renovate's PR label) |
+| 5 | Check Renovate's Merge Confidence for the update | Script (from the badge in Renovate's PR description) |
 | 6 | Apply the change and run the full test suite | Script |
 | 7 | If the tests pass, commit and push the fix to the PR; otherwise revert | Script |
 | 8 | Post a report on the PR | Script |
@@ -30,7 +30,7 @@ The fix is applied only when:
 
 Otherwise, nothing is pushed and the report asks for human review. When Merge Confidence is below `high`, the report still includes Claude's root cause and proposed fix, but the fix isn't applied: low confidence means the update itself may be at fault, so a person should decide.
 
-Merge Confidence is Renovate's rating of how safe an update is, based on how other projects fared with it (`low`, `neutral`, `high`, `very high`). Renovate adds it to the PR as a `merge-confidence:<level>` label. If the label is missing, Merge Confidence is treated as `unknown` and the fix isn't applied.
+Merge Confidence is Renovate's rating of how safe an update is, based on how other projects fared with it (`low`, `neutral`, `high`, `very high`). Renovate shows it as a **Confidence** badge in the PR description; the agent reads the level from that badge. If the badge is missing or unrecognised, Merge Confidence is treated as `unknown` and the fix isn't applied.
 
 ## Running the demo
 
@@ -98,7 +98,7 @@ Options:
 | `--dry-run` | Analyse and test, but don't commit, push or comment |
 | `--threshold 0.95` | Raise the confidence required for both Jev decisions |
 | `--min-merge-confidence <level>` | Lowest Merge Confidence at which the fix is applied (default `high`) |
-| `--merge-confidence <level>` | Use this Merge Confidence instead of the PR label, for example in local runs |
+| `--merge-confidence <level>` | Use this Merge Confidence instead of reading Renovate's badge |
 | `--log-file <path>` | Triage a saved failure log, for example a network error, to show an `OTHER` classification |
 
 ## Repository configuration
@@ -106,7 +106,7 @@ Options:
 | File | Purpose |
 |---|---|
 | `requirements-test.txt` | Test dependencies pinned as of 2024-09-01, generated from `requirements-test.in` |
-| `renovate.json` | Renovate proposes only the `httpx` update, labels the PR with its Merge Confidence, runs on this fork, recreates the PR after a reset, and doesn't rebase a branch once the fix is pushed |
+| `renovate.json` | Renovate proposes only the `httpx` update, runs on this fork, recreates the PR after a reset, and doesn't rebase a branch once the fix is pushed |
 | `.whitesource` | Turns off Mend's security scans, which aren't part of this demo |
 | `.github/workflows/ci.yml` | Runs the test suite on every pull request |
 | `.github/workflows/remediate.yml` | The **Remediate dependency PR** workflow |
