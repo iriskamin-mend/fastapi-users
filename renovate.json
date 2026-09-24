@@ -21,6 +21,42 @@
         "!httpx"
       ],
       "enabled": false
+    },
+    {
+      "description": "Label the PR with Renovate's Merge Confidence (low) for the remediation gate",
+      "matchConfidence": [
+        "low"
+      ],
+      "addLabels": [
+        "merge-confidence:low"
+      ]
+    },
+    {
+      "description": "Label the PR with Renovate's Merge Confidence (neutral) for the remediation gate",
+      "matchConfidence": [
+        "neutral"
+      ],
+      "addLabels": [
+        "merge-confidence:neutral"
+      ]
+    },
+    {
+      "description": "Label the PR with Renovate's Merge Confidence (high) for the remediation gate",
+      "matchConfidence": [
+        "high"
+      ],
+      "addLabels": [
+        "merge-confidence:high"
+      ]
+    },
+    {
+      "description": "Label the PR with Renovate's Merge Confidence (very high) for the remediation gate",
+      "matchConfidence": [
+        "very high"
+      ],
+      "addLabels": [
+        "merge-confidence:very-high"
+      ]
     }
   ],
   "rebaseWhen": "conflicted",

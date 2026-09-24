@@ -36,6 +36,9 @@ MAX_LOG_CHARS = 12_000
 MAX_NOTES_CHARS = 8_000
 MAX_DIFF_CHARS = 6_000
 COMMENT_MARKER = "<!-- agentic-remediation -->"
+# Renovate Merge Confidence levels, lowest to highest. Renovate adds them to the PR as
+# "merge-confidence:<level>" labels (packageRules with matchConfidence in renovate.json).
+MERGE_CONFIDENCE_LEVELS = ["low", "neutral", "high", "very high"]
 
 
 # --------------------------------------------------------------------------- utils
@@ -165,6 +168,7 @@ class Context:
     log_source: str
     bumps: list[Bump] = field(default_factory=list)
     release_notes: str = ""
+    merge_confidence: Optional[str] = None  # Renovate Merge Confidence level, if known
 
 
 REQ_LINE = re.compile(r"^([+-])\s*([A-Za-z0-9_.\-\[\]]+)==([^\s;#]+)", re.M)
@@ -272,16 +276,31 @@ def ci_failure_log(repo: str, branch: str) -> Optional[tuple[str, str]]:
     return f"GitHub Actions run {run_id}", extract_pytest_failure("\n".join(lines))
 
 
+def merge_confidence_from_labels(labels: list[str]) -> Optional[str]:
+    for label in labels:
+        if label.startswith("merge-confidence:"):
+            level = label.split(":", 1)[1].replace("-", " ").strip().lower()
+            if level in MERGE_CONFIDENCE_LEVELS:
+                return level
+    return None
+
+
+def merge_confidence_ok(level: Optional[str], minimum: str) -> bool:
+    return level is not None and MERGE_CONFIDENCE_LEVELS.index(level) >= MERGE_CONFIDENCE_LEVELS.index(minimum)
+
+
 def collect_context(args: argparse.Namespace) -> Context:
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     if args.pr:
         info = json.loads(
-            run(["gh", "pr", "view", str(args.pr), "-R", args.repo, "--json", "headRefName,baseRefName"]).stdout
+            run(["gh", "pr", "view", str(args.pr), "-R", args.repo, "--json", "headRefName,baseRefName,labels"]).stdout
         )
         branch = info["headRefName"]
+        labels = [lb["name"] for lb in info.get("labels", [])]
         diff = run(["gh", "pr", "diff", str(args.pr), "-R", args.repo]).stdout
     else:
         diff = run(["git", "diff", f"{args.base}...HEAD"]).stdout
+        labels = []
 
     failure_log, source = None, ""
     if args.log_file:
@@ -299,6 +318,7 @@ def collect_context(args: argparse.Namespace) -> Context:
 
     ctx = Context(args.repo, args.pr, branch, diff, clip(failure_log, MAX_LOG_CHARS), source)
     ctx.bumps = parse_bumps(diff)
+    ctx.merge_confidence = args.merge_confidence or merge_confidence_from_labels(labels)
     ctx.release_notes = clip(
         "\n\n".join(fetch_release_notes(b) for b in ctx.bumps) or "(no dependency bumps detected in diff)",
         MAX_NOTES_CHARS,
@@ -556,6 +576,10 @@ def render_report(ctx: Context, outcome: str, triage: dict, analysis: Optional[d
         f"| Failure Classification | `{triage['category']}` | {pct(triage['category_confidence'])} | "
         f"{'pass' if triage['category_ok'] else 'fail'} (≥ {pct(triage['threshold'])}, `API_BREAK`) |",
     ]
+    lines.append(
+        f"| Merge Confidence (Renovate) | `{ctx.merge_confidence or 'unknown'}` | – | "
+        f"{'pass' if triage['merge_confidence_ok'] else 'fail'} (≥ `{triage['min_merge_confidence']}`) |"
+    )
     if "fixable" in triage:
         lines.append(
             f"| is_fixable | `{str(triage['fixable'] >= 0.5).lower()}` | {pct(triage['fixable'])} | "
@@ -636,6 +660,10 @@ def main() -> int:
     python = subprocess.list2cmdline([sys.executable]) if os.name == "nt" else shlex.quote(sys.executable)
     ap.add_argument("--test-cmd", default=f"{python} -m pytest -q -p no:cacheprovider --tb=short")
     ap.add_argument("--threshold", type=float, default=0.8)
+    ap.add_argument("--min-merge-confidence", default="high", choices=MERGE_CONFIDENCE_LEVELS,
+                    help="lowest Renovate Merge Confidence level at which the fix is applied")
+    ap.add_argument("--merge-confidence", choices=MERGE_CONFIDENCE_LEVELS,
+                    help="use this level instead of the PR's merge-confidence label (e.g. local runs)")
     ap.add_argument("--dry-run", action="store_true", help="don't commit, push, or comment")
     ap.add_argument("--report", default="remediation-report.md")
     ap.add_argument("--trace", default="remediation-trace.json", help="step-by-step trace output")
@@ -664,6 +692,7 @@ def remediate(args: argparse.Namespace) -> str:
             failure_log_source=ctx.log_source,
             dependency_change=bumps_text(ctx),
             release_notes_source=ctx.release_notes.splitlines()[0] if ctx.release_notes else "",
+            merge_confidence=ctx.merge_confidence,
             decision=f"{bumps_text(ctx)}; log from {ctx.log_source}",
         )
     log(f"branch={ctx.branch} bumps={bumps_text(ctx)} log={ctx.log_source}")
@@ -671,7 +700,9 @@ def remediate(args: argparse.Namespace) -> str:
     # Step 1: Jev classification
     category, conf = jev_classify(ctx)
     triage = {"category": category, "category_confidence": conf, "threshold": args.threshold,
-              "category_ok": category == "API_BREAK" and conf >= args.threshold}
+              "category_ok": category == "API_BREAK" and conf >= args.threshold,
+              "min_merge_confidence": args.min_merge_confidence,
+              "merge_confidence_ok": merge_confidence_ok(ctx.merge_confidence, args.min_merge_confidence)}
     if not triage["category_ok"]:
         triage["verification"] = "Skipped: classification gate not met; no code changes attempted."
         outcome = "other" if category == "OTHER" else "human"
@@ -688,7 +719,23 @@ def remediate(args: argparse.Namespace) -> str:
         publish(ctx, render_report(ctx, "human", triage, analysis), args)
         return "human"
 
-    # Step 4: apply + verify (quality gate)
+    # Step 4: Renovate Merge Confidence gate. The analysis above is reported either way; low
+    # confidence means the update itself may be at fault, so a person should decide.
+    with TRACE.step("Merge Confidence gate", "Renovate") as step:
+        step["merge_confidence"] = ctx.merge_confidence
+        step["decision"] = (
+            f"{ctx.merge_confidence or 'unknown'} "
+            f"({'pass' if triage['merge_confidence_ok'] else 'fail'}, minimum {args.min_merge_confidence})"
+        )
+    if not triage["merge_confidence_ok"]:
+        triage["verification"] = (
+            f"Skipped: Renovate Merge Confidence is `{ctx.merge_confidence or 'unknown'}` "
+            f"(minimum `{args.min_merge_confidence}`); the proposed fix was not applied."
+        )
+        publish(ctx, render_report(ctx, "human", triage, analysis), args)
+        return "human"
+
+    # Step 5: apply + verify (quality gate)
     with TRACE.step("Apply edits", "Script") as step:
         try:
             touched = apply_edits(analysis["edits"])
@@ -721,7 +768,8 @@ def remediate(args: argparse.Namespace) -> str:
             run(["git", "add", *touched])
             msg = (
                 f"fix: adapt to {bumps_text(ctx)} breaking change\n\n{analysis['fix_summary']}\n\n"
-                f"Triage: Jev {category} ({pct(conf)}), is_fixable {pct(triage['fixable'])}.\n"
+                f"Triage: Jev {category} ({pct(conf)}), is_fixable {pct(triage['fixable'])}, "
+                f"Merge Confidence {ctx.merge_confidence}.\n"
                 f"Automated by tools/remediation/remediate.py"
             )
             run(["git", "-c", "user.name=remediation-bot",
