@@ -1,0 +1,8 @@
+{
+  "scanSettings": {
+    "enableSCA": false
+  },
+  "scanSettingsSAST": {
+    "enableScan": false
+  }
+}
