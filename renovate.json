@@ -1,0 +1,21 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "baseBranchPatterns": ["poc-baseline"],
+  "enabledManagers": ["pip_requirements"],
+  "pip_requirements": {
+    "managerFilePatterns": ["/(^|/)requirements-test\\.txt$/"]
+  },
+  "packageRules": [
+    {
+      "description": "POC: only propose the httpx update",
+      "matchPackageNames": ["!httpx"],
+      "enabled": false
+    }
+  ],
+  "rebaseWhen": "conflicted",
+  "prHourlyLimit": 0,
+  "prConcurrentLimit": 0,
+  "dependencyDashboard": false,
+  "labels": ["dependencies"]
+}

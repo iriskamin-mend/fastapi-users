@@ -1,0 +1,8 @@
+-e .[sqlalchemy,beanie,oauth,redis]
+pytest
+pytest-asyncio
+pytest-mock
+asgi_lifespan
+httpx==0.27.2
+httpx-oauth==0.14.1
+uvicorn

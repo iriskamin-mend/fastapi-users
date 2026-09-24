@@ -109,3 +109,6 @@ ENV/
 
 # .idea
 .idea/
+
+.venv/
+remediation-report.md
