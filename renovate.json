@@ -30,5 +30,6 @@
   "labels": [
     "dependencies"
   ],
-  "recreateWhen": "always"
+  "recreateWhen": "always",
+  "forkProcessing": "enabled"
 }
