@@ -1,3 +1,6 @@
+> [!NOTE]
+> **This fork hosts the Renovate Agentic Remediation POC.** See [tools/remediation/README.md](tools/remediation/README.md) for how it works and how to run the demo. The rest of this page is the original FastAPI Users README.
+
 # FastAPI Users
 
 <p align="center">

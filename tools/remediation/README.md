@@ -1,74 +1,108 @@
-# Autonomous dependency remediation (POC)
+# Renovate Agentic Remediation (POC)
 
-This fork of `fastapi-users` is pinned to **v13.0.0** with test dependencies frozen as of
-2024-09-01 (`requirements-test.txt`, generated from `requirements-test.in`). Renovate proposes
-one update, **httpx 0.27.2 → 0.28.1**. httpx 0.28 removed `AsyncClient(app=...)`, so every test
-that uses the client fixture fails. `remediate.py` triages the failure and fixes it.
+When a Renovate dependency update breaks the tests, an AI agent works out why, fixes the code, verifies the fix, and pushes it to the PR for a human to review.
 
-## Pipeline
+## The scenario
 
-| Step | Who | What |
+- **Repository:** a fork of [`fastapi-users`](https://github.com/fastapi-users/fastapi-users), pinned to v13.0.0 on the `poc-baseline` branch.
+- **Update:** Renovate bumps `httpx` from 0.27.2 to 0.28.1.
+- **Breaking change:** httpx 0.28 removed the `app` argument of `httpx.AsyncClient`. The test fixture in `tests/conftest.py` uses it, so the test suite fails.
+- **Expected fix:** replace `app=app` with `transport=httpx.ASGITransport(app=app)`. The upstream maintainers made the same change in v14.0.0.
+
+## How it works
+
+| # | Step | Done by |
 |---|---|---|
-| 1. Context | script | CI failure log (`gh run view --log-failed`, or a local pytest run), PR diff, bumped packages, upstream release notes (PyPI → GitHub Releases → CHANGELOG) |
-| 2. Classify | **Jev** `typesafe/jev-1.13` | `choice`: `API_BREAK` / `OTHER` + confidence. Gate: `API_BREAK` and ≥ 0.8 |
-| 3. Analyse | **Claude** (Claude Code CLI, `sonnet`) | Read-only repo access. Returns root cause, upstream change, fix summary, exact edits |
-| 4. Fixability | **Jev** | `noul`: is_fixable probability for the proposed change. Gate: ≥ 0.8 |
-| 5. Verify | script | Apply edits, run the full test suite. Green → commit + push to the PR branch. Red → revert |
-| 6. Report | script | PR comment (+ job summary, `remediation-report.md`) with Jev's decisions and Claude's analysis |
+| 1 | Collect the CI failure log, the PR diff and the upstream release notes | Script |
+| 2 | Classify the failure as `API_BREAK` or `OTHER`, with a confidence score | Jev (`typesafe/jev-1.13` via OpenRouter) |
+| 3 | Explain the root cause and propose the code change | Claude (Sonnet, via Claude Code) |
+| 4 | Decide whether the proposed change fixes the failure (`is_fixable`), with a confidence score | Jev |
+| 5 | Apply the change and run the full test suite | Script |
+| 6 | If the tests pass, commit and push the fix to the PR; otherwise revert | Script |
+| 7 | Post a report on the PR | Script |
 
-Jev is called via OpenRouter's decisions endpoint (`POST /api/alpha/decisions`); it does not
-support chat completions. Each Jev call costs about $0.00004; a Claude analysis about $0.04.
+The fix is applied only when:
 
-Renovate won't overwrite the fix: it stops updating a branch once someone else has committed
-to it, and `rebaseWhen: conflicted` stops routine rebases.
+- the failure is classified as `API_BREAK` with confidence of at least 0.8;
+- `is_fixable` has confidence of at least 0.8;
+- all tests pass after the change.
 
-Mend's SCA and SAST checks are turned off for this repo in `.whitesource`; they aren't part of
-this demo.
+Otherwise, nothing is pushed and the report asks for human review.
 
-## Setup (one time)
+## Running the demo
 
-Repository secrets (Settings → Secrets and variables → Actions): `OPENROUTER_API_KEY` (OpenRouter
-key) and `CLAUDE_CODE_OAUTH_TOKEN` (output of `claude setup-token`).
+Demo PRs are never merged. Merging would upgrade `poc-baseline` and leave Renovate nothing to propose.
 
-## Demo runbook
+### 1. Reset (skip on the first run)
 
-PRs are **not merged**: merging would move `poc-baseline` to httpx 0.28.1 and leave Renovate
-nothing to propose. Reset instead (step 0).
+1. Open the existing **Update dependency httpx to v0.28.1** pull request.
+2. Click **Close pull request**.
+3. Click **Delete branch**.
 
-0. **Reset** (skip on the very first run). If an httpx PR is open: open it → **Close pull
-   request** → **Delete branch**. Check no `renovate/httpx-0.x` branch is left under
-   *Branches*.
-1. **Renovate opens the PR.** https://developer.mend.io → this repository → run Renovate. Within
-   a few minutes *Update dependency httpx to v0.28.1* appears, authored by `mend[bot]` (the
-   hosted Renovate app).
-2. **CI fails.** On the PR, the `CI / test` check goes red:
-   `TypeError: AsyncClient.__init__() got an unexpected keyword argument 'app'`.
-3. **Run the agent.** Actions → **Remediate dependency PR** → **Run workflow** → enter the PR
-   number → **Run workflow**. Takes about 2 minutes.
-4. **Approve CI on the fix.** GitHub holds CI for commits pushed by a bot. On the PR, scroll to
-   the checks box (or open the **Checks** tab) and click **Approve and run**, then wait for
-   `CI / test` to go green (about 1 minute).
-5. **Show the result** on the PR:
-   - the **Renovate agentic remediation fix** comment: triage table (failure classification,
-     is_fixable, confidences), root cause, upstream breaking change, proposed diff, test result;
-   - **Commits**: `mend[bot]`'s dependency bump, then `remediation-bot`'s one-line fix in
-     `tests/conftest.py` (`transport=httpx.ASGITransport(app=app)`, the same fix upstream made in
-     v14.0.0);
-   - **Checks**: `CI / test` green.
-6. **Leave the PR open**, or reset (step 0) for the next run.
+### 2. Let Renovate open the PR
 
-Local alternative to step 3 (PR branch checked out, deps installed):
+1. Go to [developer.mend.io](https://developer.mend.io) and open `iriskamin-mend/fastapi-users`.
+2. Run Renovate.
+3. Within a few minutes, **Update dependency httpx to v0.28.1** appears under **Pull requests**, opened by `mend[bot]`.
+4. The PR's **CI / test** check fails with `TypeError: AsyncClient.__init__() got an unexpected keyword argument 'app'`.
+
+### 3. Run the agent
+
+1. Go to **Actions** → **Remediate dependency PR**.
+2. Click **Run workflow**, enter the PR number, and click **Run workflow**.
+3. Wait for the run to finish (about 2 minutes).
+
+### 4. Approve CI on the fix
+
+GitHub doesn't run CI automatically on commits pushed by a bot.
+
+1. Open the PR.
+2. In the checks section, click **Approve and run**.
+3. Wait for **CI / test** to pass (about 1 minute).
+
+### 5. Show the result
+
+| PR tab | What to show |
+|---|---|
+| Conversation | The **Renovate agentic remediation fix** comment: the triage table, root cause, upstream breaking change, the change made, and the test result |
+| Commits | `mend[bot]`'s dependency update, then `remediation-bot`'s fix |
+| Files changed | `requirements-test.txt` (the update) and `tests/conftest.py` (the one-line fix) |
+| Checks | **CI / test** passing |
+
+## One-time setup
+
+These repository secrets are already configured (**Settings** → **Secrets and variables** → **Actions**):
+
+| Secret | Value |
+|---|---|
+| `OPENROUTER_API_KEY` | OpenRouter API key, used for Jev |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Token from `claude setup-token`, used for Claude |
+
+## Running locally
+
+With the PR branch checked out and its dependencies installed in `.venv` (Windows paths shown):
 
 ```sh
-gh pr checkout <N> && uv pip sync -p .venv requirements-test.txt
-.venv/Scripts/python tools/remediation/remediate.py --repo <owner>/fastapi-users --pr <N>
+gh pr checkout <PR number>
+uv pip sync -p .venv requirements-test.txt
+.venv/Scripts/python tools/remediation/remediate.py --repo iriskamin-mend/fastapi-users --pr <PR number>
 ```
 
-Add `--dry-run` to analyse without committing, pushing or commenting.
+Options:
 
-## Showing the other paths
+| Option | Effect |
+|---|---|
+| `--dry-run` | Analyse and test, but don't commit, push or comment |
+| `--threshold 0.95` | Raise the confidence required for both decisions |
+| `--log-file <path>` | Triage a saved failure log, for example a network error, to show an `OTHER` classification |
 
-- **`OTHER`:** run with `--log-file` pointing at a network or infra failure log. Jev classifies it
-  `OTHER` and nothing is changed.
-- **Tests fail after the fix / low confidence:** raise `--threshold 0.95`, or let a wrong edit
-  fail. The script reverts and posts the analysis for human review.
+## Repository configuration
+
+| File | Purpose |
+|---|---|
+| `requirements-test.txt` | Test dependencies pinned as of 2024-09-01, generated from `requirements-test.in` |
+| `renovate.json` | Renovate proposes only the `httpx` update, runs on this fork, recreates the PR after a reset, and doesn't rebase a branch once the fix is pushed |
+| `.whitesource` | Turns off Mend's security scans, which aren't part of this demo |
+| `.github/workflows/ci.yml` | Runs the test suite on every pull request |
+| `.github/workflows/remediate.yml` | The **Remediate dependency PR** workflow |
+| `tools/remediation/remediate.py` | The agent |
