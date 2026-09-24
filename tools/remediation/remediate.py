@@ -423,7 +423,7 @@ def pct(x: float) -> str:
 def render_report(ctx: Context, outcome: str, triage: dict, analysis: Optional[dict], test_tail: str = "") -> str:
     icon = {"fixed": "✅", "human": "🧑‍💻", "other": "ℹ️"}[outcome]
     title = {
-        "fixed": "Breaking change remediated automatically",
+        "fixed": "Renovate agentic remediation fix",
         "human": "Breaking change needs human review",
         "other": "Failure not caused by a dependency API change",
     }[outcome]
@@ -434,10 +434,10 @@ def render_report(ctx: Context, outcome: str, triage: dict, analysis: Optional[d
         f"**Dependency:** {bumps_text(ctx)}  ",
         f"**Failure log:** {ctx.log_source}",
         "",
-        "### Jev triage (`typesafe/jev-1.13`)",
+        "### Triage",
         "| Decision | Result | Confidence | Gate |",
         "|---|---|---|---|",
-        f"| Classification | `{triage['category']}` | {pct(triage['category_confidence'])} | "
+        f"| Failure Classification | `{triage['category']}` | {pct(triage['category_confidence'])} | "
         f"{'pass' if triage['category_ok'] else 'fail'} (≥ {pct(triage['threshold'])}, `API_BREAK`) |",
     ]
     if "fixable" in triage:
