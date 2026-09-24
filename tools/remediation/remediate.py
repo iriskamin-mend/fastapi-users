@@ -434,7 +434,7 @@ def render_report(ctx: Context, outcome: str, triage: dict, analysis: Optional[d
         f"**Dependency:** {bumps_text(ctx)}  ",
         f"**Failure log:** {ctx.log_source}",
         "",
-        "### Triage",
+        "### Triage (Jev)",
         "| Decision | Result | Confidence | Gate |",
         "|---|---|---|---|",
         f"| Failure Classification | `{triage['category']}` | {pct(triage['category_confidence'])} | "
