@@ -90,6 +90,8 @@ def openrouter_key() -> str:
                 key = winreg.QueryValueEx(k, "OPENROUTER_API_KEY")[0]
         except OSError:
             key = None
+    # Secrets piped in from Windows PowerShell can carry a BOM and trailing newline.
+    key = (key or "").strip().lstrip("﻿")
     if not key:
         sys.exit("OPENROUTER_API_KEY is not set")
     return key
