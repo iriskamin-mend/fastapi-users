@@ -27,35 +27,44 @@ this demo.
 
 ## Setup (one time)
 
-Repository secrets (Settings → Secrets and variables → Actions):
+Repository secrets (Settings → Secrets and variables → Actions): `OPENROUTER_API_KEY` (OpenRouter
+key) and `CLAUDE_CODE_OAUTH_TOKEN` (output of `claude setup-token`).
 
-| Secret | Value |
-|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter key |
-| `CLAUDE_CODE_OAUTH_TOKEN` | output of `claude setup-token` |
-| `REMEDIATION_PUSH_TOKEN` *(optional)* | Fine-grained PAT for this repo with *Contents: read and write* and *Pull requests: read and write*. Pushes made with the default `GITHUB_TOKEN` don't trigger CI, so without it the workflow dispatches CI itself: the result shows on the fix commit and in Actions, but not in the PR's checks list. The script has already run the full suite before pushing either way. |
+## Demo runbook
 
-## Demo walkthrough
+PRs are **not merged**: merging would move `poc-baseline` to httpx 0.28.1 and leave Renovate
+nothing to propose. Reset instead (step 0).
 
-1. **Baseline is green.** The `CI` workflow passes on `poc-baseline` (556 tests).
-2. **Renovate opens the PR.** In the Mend developer portal (https://developer.mend.io), open this
-   repository and run a Renovate job. The hosted Renovate app opens *Update dependency httpx
-   to v0.28.1* from `renovate/httpx-0.x`, authored by `renovate[bot]`.
-   To reset the demo, close the PR and delete its branch; `recreateWhen: always` lets the next
-   run open it again. (Fallback without the app, Node 24 required; the PR is then authored by
-   the token's user: `RENOVATE_TOKEN=$(gh auth token) npx -y -p node@24 -p renovate@44 -- renovate <owner>/fastapi-users`.)
-3. **CI fails** with `TypeError: AsyncClient.__init__() got an unexpected keyword argument 'app'`.
-4. **Remediate.** Either:
-   - GitHub: Actions → *Remediate dependency PR* → Run workflow → PR number, or
-   - locally, with the PR branch checked out and its deps installed:
-     ```sh
-     gh pr checkout <N> && uv pip sync -p .venv requirements-test.txt
-     .venv/Scripts/python tools/remediation/remediate.py --repo <owner>/fastapi-users --pr <N>
-     ```
-     Add `--dry-run` to analyse without committing, pushing or commenting.
-5. **Result.** The PR gets a `remediation-bot` commit that changes `tests/conftest.py` to
-   `transport=httpx.ASGITransport(app=app)` and a comment with the triage table. Compare with
-   upstream's own fix in v14.0.0.
+0. **Reset** (skip on the very first run). If an httpx PR is open: open it → **Close pull
+   request** → **Delete branch**. Check no `renovate/httpx-0.x` branch is left under
+   *Branches*.
+1. **Renovate opens the PR.** https://developer.mend.io → this repository → run Renovate. Within
+   a few minutes *Update dependency httpx to v0.28.1* appears, authored by `mend[bot]` (the
+   hosted Renovate app).
+2. **CI fails.** On the PR, the `CI / test` check goes red:
+   `TypeError: AsyncClient.__init__() got an unexpected keyword argument 'app'`.
+3. **Run the agent.** Actions → **Remediate dependency PR** → **Run workflow** → enter the PR
+   number → **Run workflow**. Takes about 2 minutes.
+4. **Approve CI on the fix.** GitHub holds CI for commits pushed by a bot. On the PR, scroll to
+   the checks box (or open the **Checks** tab) and click **Approve and run**, then wait for
+   `CI / test` to go green (about 1 minute).
+5. **Show the result** on the PR:
+   - the **Renovate agentic remediation fix** comment: triage table (failure classification,
+     is_fixable, confidences), root cause, upstream breaking change, proposed diff, test result;
+   - **Commits**: `mend[bot]`'s dependency bump, then `remediation-bot`'s one-line fix in
+     `tests/conftest.py` (`transport=httpx.ASGITransport(app=app)`, the same fix upstream made in
+     v14.0.0);
+   - **Checks**: `CI / test` green.
+6. **Leave the PR open**, or reset (step 0) for the next run.
+
+Local alternative to step 3 (PR branch checked out, deps installed):
+
+```sh
+gh pr checkout <N> && uv pip sync -p .venv requirements-test.txt
+.venv/Scripts/python tools/remediation/remediate.py --repo <owner>/fastapi-users --pr <N>
+```
+
+Add `--dry-run` to analyse without committing, pushing or commenting.
 
 ## Showing the other paths
 
