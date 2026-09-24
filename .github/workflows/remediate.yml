@@ -51,4 +51,6 @@ jobs:
         if: always()
         with:
           name: remediation-report
-          path: remediation-report.md
+          path: |
+            remediation-report.md
+            remediation-trace.json

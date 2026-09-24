@@ -21,10 +21,13 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import time
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 JEV_MODEL = "typesafe/jev-1.13"
 JEV_URL = "https://openrouter.ai/api/alpha/decisions"
@@ -77,6 +80,51 @@ def clip(text: str, limit: int, *, keep: str = "head") -> str:
     if keep == "tail":
         return "…[truncated]…\n" + text[-limit:]
     return text[:limit] + "\n…[truncated]…"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class Trace:
+    """Step-by-step record of the run: inputs, outputs, reasoning, tokens and cost per step.
+
+    Written to remediation-trace.json (uploaded as a workflow artifact) and summarized in the
+    PR report's "Agent timeline".
+    """
+
+    def __init__(self) -> None:
+        self.data: dict[str, Any] = {"started_at": now_iso(), "steps": []}
+
+    @contextmanager
+    def step(self, name: str, actor: str) -> Iterator[dict]:
+        entry: dict[str, Any] = {"step": name, "actor": actor, "started_at": now_iso()}
+        self.data["steps"].append(entry)
+        t0 = time.monotonic()
+        try:
+            yield entry
+        except BaseException as e:
+            entry["error"] = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            entry["duration_s"] = round(time.monotonic() - t0, 2)
+
+    def totals(self) -> dict:
+        tot = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        for s in self.data["steps"]:
+            u = s.get("usage") or {}
+            tot["input_tokens"] += u.get("input_tokens", 0)
+            tot["output_tokens"] += u.get("output_tokens", 0)
+            tot["cost_usd"] += u.get("cost_usd", 0.0)
+        tot["cost_usd"] = round(tot["cost_usd"], 6)
+        return tot
+
+    def write(self, path: str, **run_info: Any) -> None:
+        self.data.update(run_info, finished_at=now_iso(), totals=self.totals())
+        Path(path).write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+TRACE = Trace()
 
 
 def openrouter_key() -> str:
@@ -261,13 +309,22 @@ def collect_context(args: argparse.Namespace) -> Context:
 # --------------------------------------------------------------------------- Jev
 
 
-def jev(state: str | dict, questions: dict) -> dict:
-    resp = http_json(
-        JEV_URL,
-        data={"model": JEV_MODEL, "state": state, "questions": questions},
-        headers={"Authorization": f"Bearer {openrouter_key()}"},
+def jev(step: dict, state: str | dict, questions: dict) -> dict:
+    request = {"model": JEV_MODEL, "state": state, "questions": questions}
+    step["request"] = request  # Jev returns decisions only, so its input is the closest thing to a rationale
+    resp = http_json(JEV_URL, data=request, headers={"Authorization": f"Bearer {openrouter_key()}"})
+    usage = resp.get("usage", {})
+    step.update(
+        model=resp.get("model", JEV_MODEL),
+        generation_id=resp.get("id"),
+        answers=resp["answers"],
+        usage={
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cost_usd": usage.get("cost", 0.0),
+        },
     )
-    log(f"jev answers={json.dumps(resp['answers'])} cost=${resp.get('usage', {}).get('cost')}")
+    log(f"jev answers={json.dumps(resp['answers'])} cost=${usage.get('cost')}")
     return resp["answers"]
 
 
@@ -282,7 +339,7 @@ def jev_classify(ctx: Context) -> tuple[str, float]:
         "failure_log": ctx.failure_log,
         "upstream_release_notes": clip(ctx.release_notes, 4000),
     }
-    a = jev(state, {
+    questions = {
         "category": {
             "type": "choice",
             "instructions": "Classify the cause of this CI test failure that occurred after a dependency update.",
@@ -293,8 +350,12 @@ def jev_classify(ctx: Context) -> tuple[str, float]:
                          "the updated dependency's API.",
             },
         }
-    })["category"]
-    return a["choice"], float(a.get("confidence", a["probabilities"][a["choice"]]))
+    }
+    with TRACE.step("Failure classification", "Jev") as step:
+        a = jev(step, state, questions)["category"]
+        choice, conf = a["choice"], float(a.get("confidence", a["probabilities"][a["choice"]]))
+        step["decision"] = f"{choice} (confidence {conf:.2f})"
+    return choice, conf
 
 
 def jev_fixable(ctx: Context, analysis: dict) -> float:
@@ -309,13 +370,17 @@ def jev_fixable(ctx: Context, analysis: dict) -> float:
         "proposed_fix": analysis["fix_summary"],
         "proposed_edits": edits or "(none)",
     }
-    return float(jev(state, {
+    questions = {
         "is_fixable": {
             "type": "noul",
             "instructions": "Is this failure fixable by the proposed targeted code change in this "
                             "repository, keeping the new dependency version and without side effects?",
         }
-    })["is_fixable"]["noul"])
+    }
+    with TRACE.step("Fixability (is_fixable)", "Jev") as step:
+        score = float(jev(step, state, questions)["is_fixable"]["noul"])
+        step["decision"] = f"is_fixable={str(score >= 0.5).lower()} (confidence {score:.2f})"
+    return score
 
 
 # --------------------------------------------------------------------------- Claude
@@ -348,7 +413,8 @@ SYSTEM_PROMPT = (
     "repository. Investigate with the read-only tools, then answer in the required JSON schema. "
     "Adapt the code to the NEW dependency API; never pin, downgrade, or edit requirement files. "
     "Keep edits minimal. Every old_string must match the file exactly (including indentation) and "
-    "occur exactly once; include surrounding lines if needed to make it unique."
+    "occur exactly once; include surrounding lines if needed to make it unique. "
+    "Ignore tools/remediation/ (this remediation tooling) and don't edit it."
 )
 
 
@@ -375,20 +441,70 @@ def claude_analyze(ctx: Context) -> dict:
         the log) and propose the edits that fix it.
         """)
     cmd = [
-        "claude", "-p", "--model", CLAUDE_MODEL, "--output-format", "json",
+        "claude", "-p", "--model", CLAUDE_MODEL, "--output-format", "stream-json", "--verbose",
         "--tools", "Read,Grep,Glob", "--system-prompt", SYSTEM_PROMPT,
         "--json-schema", json.dumps(ANALYSIS_SCHEMA), "--strict-mcp-config",
     ]
-    log(f"asking Claude ({CLAUDE_MODEL}) for root cause and fix")
-    p = run(cmd, input=prompt, check=False)
-    try:
-        out = json.loads(p.stdout)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"claude CLI returned non-JSON output:\n{p.stdout}\n{p.stderr}")
-    if out.get("is_error") or not out.get("structured_output"):
-        raise RuntimeError(f"claude CLI error: {out.get('result')}")
-    log(f"claude cost=${out.get('total_cost_usd')}")
-    return out["structured_output"]
+    with TRACE.step("Root cause and fix", "Claude") as step:
+        step["request"] = {"model": CLAUDE_MODEL, "system_prompt": SYSTEM_PROMPT, "prompt": prompt}
+        log(f"asking Claude ({CLAUDE_MODEL}) for root cause and fix")
+        p = run(cmd, input=prompt, check=False)
+        transcript, result = parse_claude_stream(p.stdout)
+        step["transcript"] = transcript
+        if result is None:
+            raise RuntimeError(f"claude CLI returned no result:\n{p.stdout[-2000:]}\n{p.stderr[-2000:]}")
+        usage = result.get("usage") or {}
+        step.update(
+            model=", ".join((result.get("modelUsage") or {}).keys()) or CLAUDE_MODEL,
+            turns=result.get("num_turns"),
+            usage={
+                "input_tokens": usage.get("input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+                "cost_usd": result.get("total_cost_usd", 0.0),
+            },
+        )
+        if result.get("is_error") or not result.get("structured_output"):
+            raise RuntimeError(f"claude CLI error: {result.get('result')}")
+        analysis = result["structured_output"]
+        step["answer"] = analysis
+        step["decision"] = f"{len(analysis['edits'])} edit(s), self-reported confidence {analysis['confidence']:.2f}"
+        log(f"claude cost=${result.get('total_cost_usd')} turns={result.get('num_turns')}")
+    return analysis
+
+
+def parse_claude_stream(stdout: str) -> tuple[list[dict], Optional[dict]]:
+    """Turn Claude Code's stream-json events into a readable transcript plus the final result."""
+    transcript: list[dict] = []
+    result = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("type")
+        if kind == "result":
+            result = event
+        elif kind in ("assistant", "user"):
+            content = event.get("message", {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                btype = block.get("type")
+                if btype == "text" and block.get("text", "").strip():
+                    transcript.append({"type": "note", "text": block["text"]})
+                elif btype == "thinking" and block.get("thinking", "").strip():
+                    transcript.append({"type": "thinking", "text": block["thinking"]})
+                elif btype == "tool_use" and block.get("name") != "StructuredOutput":
+                    transcript.append({"type": "tool_call", "tool": block.get("name"), "input": block.get("input")})
+                elif btype == "tool_result":
+                    body = block.get("content")
+                    if isinstance(body, list):
+                        body = "\n".join(b.get("text", "") for b in body if isinstance(b, dict))
+                    if body and "Structured output provided" not in str(body):
+                        transcript.append({"type": "tool_result", "content": clip(str(body), 3000)})
+    return transcript, result
 
 
 # --------------------------------------------------------------------------- apply / verify
@@ -469,7 +585,32 @@ def render_report(ctx: Context, outcome: str, triage: dict, analysis: Optional[d
         lines += ["", f"### Verification\n{triage['verification']}"]
     if test_tail:
         lines += ["", "<details><summary>Test output (tail)</summary>", "", "```", test_tail, "```", "</details>"]
+    lines += ["", *render_timeline()]
     return "\n".join(lines)
+
+
+def render_timeline() -> list[str]:
+    rows = [
+        "<details><summary>Agent timeline (tokens and cost per step)</summary>",
+        "",
+        "| Step | Actor | Result | Duration | Tokens in / out | Cost (USD) |",
+        "|---|---|---|---|---|---|",
+    ]
+    for s in TRACE.data["steps"]:
+        u = s.get("usage")
+        tokens = f"{u['input_tokens']:,} / {u['output_tokens']:,}" if u else "–"
+        cost = f"{u['cost_usd']:.5f}" if u else "–"
+        result = s.get("error") or s.get("decision", "")
+        rows.append(f"| {s['step']} | {s['actor']} | {result} | {s.get('duration_s', 0):.1f}s | {tokens} | {cost} |")
+    t = TRACE.totals()
+    rows += [
+        f"| **Total** | | | | **{t['input_tokens']:,} / {t['output_tokens']:,}** | **{t['cost_usd']:.5f}** |",
+        "",
+        "Full trace (Jev inputs and answers, Claude's step-by-step investigation): "
+        "`remediation-trace.json` in the workflow run's artifacts.",
+        "</details>",
+    ]
+    return rows
 
 
 def publish(ctx: Context, report: str, args: argparse.Namespace) -> None:
@@ -497,11 +638,34 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=0.8)
     ap.add_argument("--dry-run", action="store_true", help="don't commit, push, or comment")
     ap.add_argument("--report", default="remediation-report.md")
+    ap.add_argument("--trace", default="remediation-trace.json", help="step-by-step trace output")
     args = ap.parse_args()
     if args.pr and not args.repo:
         ap.error("--repo is required with --pr")
 
-    ctx = collect_context(args)
+    run_info: dict[str, Any] = {"repo": args.repo, "pr": args.pr, "threshold": args.threshold,
+                                "dry_run": args.dry_run, "outcome": "error"}
+    try:
+        run_info["outcome"] = remediate(args)
+        return 0
+    finally:
+        TRACE.write(args.trace, **run_info)
+        t = TRACE.totals()
+        log(f"trace written to {args.trace}: {t['input_tokens']} in / {t['output_tokens']} out tokens, "
+            f"${t['cost_usd']:.5f}")
+
+
+def remediate(args: argparse.Namespace) -> str:
+    """Run the flow; returns the outcome recorded in the trace."""
+    with TRACE.step("Collect context", "Script") as step:
+        ctx = collect_context(args)
+        step.update(
+            branch=ctx.branch,
+            failure_log_source=ctx.log_source,
+            dependency_change=bumps_text(ctx),
+            release_notes_source=ctx.release_notes.splitlines()[0] if ctx.release_notes else "",
+            decision=f"{bumps_text(ctx)}; log from {ctx.log_source}",
+        )
     log(f"branch={ctx.branch} bumps={bumps_text(ctx)} log={ctx.log_source}")
 
     # Step 1: Jev classification
@@ -510,8 +674,9 @@ def main() -> int:
               "category_ok": category == "API_BREAK" and conf >= args.threshold}
     if not triage["category_ok"]:
         triage["verification"] = "Skipped: classification gate not met; no code changes attempted."
-        publish(ctx, render_report(ctx, "other" if category == "OTHER" else "human", triage, None), args)
-        return 0
+        outcome = "other" if category == "OTHER" else "human"
+        publish(ctx, render_report(ctx, outcome, triage, None), args)
+        return outcome
 
     # Step 2: Claude root cause + proposed edits
     analysis = claude_analyze(ctx)
@@ -521,42 +686,52 @@ def main() -> int:
     if triage["fixable"] < args.threshold:
         triage["verification"] = "Skipped: is_fixable gate not met; no code changes applied."
         publish(ctx, render_report(ctx, "human", triage, analysis), args)
-        return 0
+        return "human"
 
     # Step 4: apply + verify (quality gate)
-    try:
-        touched = apply_edits(analysis["edits"])
-    except (ValueError, OSError) as e:
-        triage["verification"] = f"Could not apply edits: {e}. Reverted."
+    with TRACE.step("Apply edits", "Script") as step:
+        try:
+            touched = apply_edits(analysis["edits"])
+            step.update(files=touched, decision=f"edited {', '.join(touched)}")
+        except (ValueError, OSError) as err:
+            step["decision"] = f"failed: {err}"
+            touched = None
+    if touched is None:
+        triage["verification"] = f"Could not apply edits: {step['decision']}. Reverted."
         revert([e["file"] for e in analysis["edits"]])
         publish(ctx, render_report(ctx, "human", triage, analysis), args)
-        return 0
+        return "human"
 
     log(f"applied edits to {touched}; running tests")
-    tests = run(args.test_cmd, check=False)
+    with TRACE.step("Run test suite", "Script") as step:
+        tests = run(args.test_cmd, check=False)
+        summary = re.findall(r"^=*\s*(\d+ (?:passed|failed|error).*?in [\d.]+s)", tests.stdout, re.M)
+        step.update(command=args.test_cmd, exit_code=tests.returncode,
+                    decision=summary[-1] if summary else f"exit code {tests.returncode}")
     tail = clip((tests.stdout if tests.returncode == 0 else tests.stdout + tests.stderr).strip(), 2500, keep="tail")
     if tests.returncode != 0:
         revert(touched)
         triage["verification"] = "❌ Tests still fail after applying the fix. Changes reverted."
         publish(ctx, render_report(ctx, "human", triage, analysis, tail), args)
-        return 0
+        return "human"
 
-    result = re.findall(r"^=*\s*(\d+ passed.*?in [\d.]+s)", tests.stdout, re.M)
-    triage["verification"] = f"✅ Full test suite passed: `{result[-1] if result else 'exit code 0'}`"
+    triage["verification"] = f"✅ Full test suite passed: `{step['decision']}`"
     if not args.dry_run:
-        run(["git", "add", *touched])
-        msg = (
-            f"fix: adapt to {bumps_text(ctx)} breaking change\n\n{analysis['fix_summary']}\n\n"
-            f"Triage: Jev {category} ({pct(conf)}), is_fixable {pct(triage['fixable'])}.\n"
-            f"Automated by tools/remediation/remediate.py"
-        )
-        run(["git", "-c", "user.name=remediation-bot",
-             "-c", "user.email=remediation-bot@users.noreply.github.com", "commit", "-m", msg])
-        run(["git", "push", "origin", f"HEAD:{ctx.branch}"])
-        sha = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+        with TRACE.step("Commit and push", "Script") as step:
+            run(["git", "add", *touched])
+            msg = (
+                f"fix: adapt to {bumps_text(ctx)} breaking change\n\n{analysis['fix_summary']}\n\n"
+                f"Triage: Jev {category} ({pct(conf)}), is_fixable {pct(triage['fixable'])}.\n"
+                f"Automated by tools/remediation/remediate.py"
+            )
+            run(["git", "-c", "user.name=remediation-bot",
+                 "-c", "user.email=remediation-bot@users.noreply.github.com", "commit", "-m", msg])
+            run(["git", "push", "origin", f"HEAD:{ctx.branch}"])
+            sha = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+            step.update(commit=sha, decision=f"pushed {sha} to {ctx.branch}")
         triage["verification"] += f"\n\nPushed fix as {sha} to `{ctx.branch}`."
     publish(ctx, render_report(ctx, "fixed", triage, analysis, tail), args)
-    return 0
+    return "fixed"
 
 
 if __name__ == "__main__":

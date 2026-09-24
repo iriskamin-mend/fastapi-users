@@ -7,7 +7,6 @@ When a Renovate dependency update breaks the tests, an AI agent works out why, f
 - **Repository:** a fork of [`fastapi-users`](https://github.com/fastapi-users/fastapi-users), pinned to v13.0.0 on the `poc-baseline` branch.
 - **Update:** Renovate bumps `httpx` from 0.27.2 to 0.28.1.
 - **Breaking change:** httpx 0.28 removed the `app` argument of `httpx.AsyncClient`. The test fixture in `tests/conftest.py` uses it, so the test suite fails.
-- **Expected fix:** replace `app=app` with `transport=httpx.ASGITransport(app=app)`. The upstream maintainers made the same change in v14.0.0.
 
 ## How it works
 
@@ -66,7 +65,7 @@ GitHub doesn't run CI automatically on commits pushed by a bot.
 |---|---|
 | Conversation | The **Renovate agentic remediation fix** comment: the triage table, root cause, upstream breaking change, the change made, and the test result |
 | Commits | `mend[bot]`'s dependency update, then `remediation-bot`'s fix |
-| Files changed | `requirements-test.txt` (the update) and `tests/conftest.py` (the one-line fix) |
+| Files changed | `requirements-test.txt` (the update) and the agent's fix |
 | Checks | **CI / test** passing |
 
 ## One-time setup

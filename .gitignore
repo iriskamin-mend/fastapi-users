@@ -112,3 +112,4 @@ ENV/
 
 .venv/
 remediation-report.md
+remediation-trace.json
