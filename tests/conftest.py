@@ -555,7 +555,7 @@ def get_test_client():
     async def _get_test_client(app: FastAPI) -> AsyncGenerator[httpx.AsyncClient, None]:
         async with LifespanManager(app):
             async with httpx.AsyncClient(
-                app=app, base_url="http://app.io"
+                transport=httpx.ASGITransport(app=app), base_url="http://app.io"
             ) as test_client:
                 yield test_client
 
