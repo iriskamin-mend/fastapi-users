@@ -31,6 +31,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Keep the agent from the default branch
+        # The PR branch may predate the latest agent (or change it); always run this version.
+        run: cp tools/remediation/remediate.py "$RUNNER_TEMP/remediate.py"
       - name: Check out PR branch
         run: gh pr checkout ${{ inputs.pr }}
       - uses: actions/setup-python@v5
@@ -44,7 +47,7 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code
       - name: Triage and remediate
         run: >
-          python tools/remediation/remediate.py
+          python "$RUNNER_TEMP/remediate.py"
           --repo ${{ github.repository }} --pr ${{ inputs.pr }}
           ${{ inputs.dry_run && '--dry-run' || '' }}
       - uses: actions/upload-artifact@v4
