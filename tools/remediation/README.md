@@ -30,7 +30,7 @@ Repository secrets (Settings → Secrets and variables → Actions):
 |---|---|
 | `OPENROUTER_API_KEY` | OpenRouter key |
 | `CLAUDE_CODE_OAUTH_TOKEN` | output of `claude setup-token` |
-| `REMEDIATION_PUSH_TOKEN` *(optional)* | PAT with `repo` scope. Pushes made with the default `GITHUB_TOKEN` don't re-trigger CI, so the PR's own check stays red until the next push; the script has already run the full suite before pushing. |
+| `REMEDIATION_PUSH_TOKEN` *(optional)* | Fine-grained PAT for this repo with *Contents: read and write* and *Pull requests: read and write*. Pushes made with the default `GITHUB_TOKEN` don't trigger CI, so without it the workflow dispatches CI itself: the result shows on the fix commit and in Actions, but not in the PR's checks list. The script has already run the full suite before pushing either way. |
 
 ## Demo walkthrough
 

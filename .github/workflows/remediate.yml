@@ -27,6 +27,7 @@ jobs:
       GH_TOKEN: ${{ secrets.REMEDIATION_PUSH_TOKEN || github.token }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      HAS_PUSH_TOKEN: ${{ secrets.REMEDIATION_PUSH_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,9 +51,10 @@ jobs:
           --repo ${{ github.repository }} --pr ${{ inputs.pr }}
           ${{ inputs.dry_run && '--dry-run' || '' }}
       - name: Re-run CI on the PR branch
-        # Pushes made with github.token don't trigger workflows, but workflow_dispatch does,
-        # and its check run attaches to the new head commit shown on the PR.
-        if: ${{ !inputs.dry_run }}
+        # Pushes made with github.token don't trigger workflows; workflow_dispatch does. The
+        # result shows on the commit and in Actions, but not in the PR's checks list; set
+        # REMEDIATION_PUSH_TOKEN for that (then the push itself triggers CI and this is skipped).
+        if: ${{ !inputs.dry_run && env.HAS_PUSH_TOKEN != 'true' }}
         run: gh workflow run ci.yml --ref "$(git rev-parse --abbrev-ref HEAD)"
       - uses: actions/upload-artifact@v4
         if: always()
