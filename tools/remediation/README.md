@@ -10,27 +10,21 @@ When a Renovate dependency update breaks the tests, an AI agent works out why, f
 
 ## How it works
 
+The cheapest checks run first, and Claude, the most expensive step, runs only when every gate has passed.
+
 | # | Step | Done by |
 |---|---|---|
-| 1 | Collect the CI failure log, the PR diff and the upstream release notes | Script |
-| 2 | Classify the failure as `API_BREAK` or `OTHER`, with a confidence score | Jev (`typesafe/jev-1.13` via OpenRouter) |
-| 3 | Explain the root cause and propose the code change | Claude (Sonnet, via Claude Code) |
-| 4 | Decide whether the proposed change fixes the failure (`is_fixable`), with a confidence score | Jev |
-| 5 | Check Renovate's Merge Confidence for the update | Script (from the badge in Renovate's PR description) |
-| 6 | Apply the change and run the full test suite | Script |
-| 7 | If the tests pass, commit and push the fix to the PR; otherwise revert | Script |
-| 8 | Post a report on the PR | Script |
+| 1 | Collect the CI failure log, the PR diff, the upstream release notes and Renovate's Merge Confidence | Script |
+| 2 | **Gate:** Merge Confidence must be `high` or `very high` | Script (from the badge in Renovate's PR description; no model) |
+| 3 | **Gates:** in one call, classify the failure (`API_BREAK` or `OTHER`) and decide whether it can be fixed by a code change (`is_fixable`), each with a confidence score; both must be at least 0.8 | Jev (`typesafe/jev-1.13` via OpenRouter) |
+| 4 | Explain the root cause and propose the code change | Claude (Sonnet, via Claude Code) |
+| 5 | Apply the change and run the full test suite | Script |
+| 6 | If the tests pass, commit and push the fix to the PR; otherwise revert | Script |
+| 7 | Post a report on the PR | Script |
 
-The fix is applied only when:
+If any gate fails, the run stops there: Claude isn't run, no code is changed, and the report says which gate stopped it. A stopped run costs at most one Jev call (about $0.00005); a full run costs about $0.03–$0.05.
 
-- the failure is classified as `API_BREAK` with confidence of at least 0.8;
-- `is_fixable` has confidence of at least 0.8;
-- Renovate's Merge Confidence for the update is `high` or `very high`;
-- all tests pass after the change.
-
-Otherwise, nothing is pushed and the report asks for human review. When Merge Confidence is below `high`, the report still includes Claude's root cause and proposed fix, but the fix isn't applied: low confidence means the update itself may be at fault, so a person should decide.
-
-Merge Confidence is Renovate's rating of how safe an update is, based on how other projects fared with it (`low`, `neutral`, `high`, `very high`). Renovate shows it as a **Confidence** badge in the PR description; the agent reads the level from that badge. If the badge is missing or unrecognised, Merge Confidence is treated as `unknown` and the fix isn't applied.
+Merge Confidence is Renovate's rating of how safe an update is, based on how other projects fared with it (`low`, `neutral`, `high`, `very high`). Low confidence means the update itself may be at fault, so a person should decide. Renovate shows it as a **Confidence** badge in the PR description; the agent reads the level from that badge. If the badge is missing or unrecognised, Merge Confidence is treated as `unknown` and the run stops.
 
 ## Running the demo
 
