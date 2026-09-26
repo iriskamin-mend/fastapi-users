@@ -1,12 +1,13 @@
 """Autonomous triage and remediation of breaking dependency updates.
 
-Flow (see tools/remediation/README.md):
-  1. Collect context: CI failure log, PR diff, dependency bumps, upstream release notes.
-  2. Jev (typesafe/jev-1.13 on OpenRouter) classifies the failure: API_BREAK or OTHER.
-  3. Claude (Claude Code CLI, headless) writes the root cause and proposes exact edits.
-  4. Jev decides is_fixable for the proposed change.
-  5. Gate passed -> apply edits, run the full test suite, and only if green commit + push.
-     Otherwise revert and post the analysis for human review.
+Flow (see tools/remediation/README.md), cheapest checks first:
+  1. Collect context: CI failure log, PR diff, dependency bumps, release notes, Merge Confidence.
+  2. Renovate Merge Confidence gate (no model): high or above, else stop.
+  3. One Jev call (typesafe/jev-1.13 on OpenRouter) decides both the failure classification
+     (API_BREAK or OTHER) and is_fixable; both must pass, else stop.
+  4. Only then Claude (Claude Code CLI, headless) writes the root cause and proposes exact edits.
+  5. Apply edits, run the full test suite, and only if green commit + push; otherwise revert.
+  Every stop posts a report for human review; Claude is never run when a gate fails.
 
 Stdlib only, so it runs in any CI image that has Python, git, gh and the claude CLI.
 """
@@ -380,7 +381,8 @@ def bumps_text(ctx: Context) -> str:
     return ", ".join(f"{b.package} {b.old} -> {b.new}" for b in ctx.bumps) or "unknown"
 
 
-def jev_classify(ctx: Context) -> tuple[str, float]:
+def jev_triage(ctx: Context) -> tuple[str, float, float]:
+    """One Jev call, two decisions: failure classification and is_fixable (before any Claude run)."""
     state = {
         "event": "CI tests failed on a dependency update PR; the PR changes nothing but the dependency pin.",
         "dependency_change": bumps_text(ctx),
@@ -397,38 +399,21 @@ def jev_classify(ctx: Context) -> tuple[str, float]:
                 "OTHER": "Flaky test, network, environment, or infrastructure failure unrelated to "
                          "the updated dependency's API.",
             },
-        }
-    }
-    with TRACE.step("Failure classification", "Jev") as step:
-        a = jev(step, state, questions)["category"]
-        choice, conf = a["choice"], float(a.get("confidence", a["probabilities"][a["choice"]]))
-        step["decision"] = f"{choice} (confidence {conf:.2f})"
-    return choice, conf
-
-
-def jev_fixable(ctx: Context, analysis: dict) -> float:
-    edits = "\n".join(
-        f"--- {e['file']}\n- {e['old_string']}\n+ {e['new_string']}" for e in analysis["edits"]
-    )
-    state = {
-        "dependency_change": bumps_text(ctx),
-        "failure_log": clip(ctx.failure_log, 4000),
-        "root_cause": analysis["root_cause"],
-        "breaking_upstream_change": analysis["breaking_change"],
-        "proposed_fix": analysis["fix_summary"],
-        "proposed_edits": edits or "(none)",
-    }
-    questions = {
+        },
         "is_fixable": {
             "type": "noul",
-            "instructions": "Is this failure fixable by the proposed targeted code change in this "
-                            "repository, keeping the new dependency version and without side effects?",
-        }
+            "instructions": "Can this failure be fixed by a targeted code change in this repository, "
+                            "keeping the new dependency version (without pinning or downgrading it)?",
+        },
     }
-    with TRACE.step("Fixability (is_fixable)", "Jev") as step:
-        score = float(jev(step, state, questions)["is_fixable"]["noul"])
-        step["decision"] = f"is_fixable={str(score >= 0.5).lower()} (confidence {score:.2f})"
-    return score
+    with TRACE.step("Triage: classification and is_fixable", "Jev") as step:
+        answers = jev(step, state, questions)
+        a = answers["category"]
+        choice, conf = a["choice"], float(a.get("confidence", a["probabilities"][a["choice"]]))
+        fixable = float(answers["is_fixable"]["noul"])
+        step["decision"] = (f"{choice} (confidence {conf:.2f}); "
+                            f"is_fixable={str(fixable >= 0.5).lower()} (confidence {fixable:.2f})")
+    return choice, conf, fixable
 
 
 # --------------------------------------------------------------------------- Claude
@@ -601,18 +586,22 @@ def render_report(ctx: Context, outcome: str, triage: dict, analysis: Optional[d
         "### Triage (Jev)",
         "| Decision | Result | Confidence | Gate |",
         "|---|---|---|---|",
-        f"| Failure Classification | `{triage['category']}` | {pct(triage['category_confidence'])} | "
-        f"{'pass' if triage['category_ok'] else 'fail'} (≥ {pct(triage['threshold'])}, `API_BREAK`) |",
-    ]
-    lines.append(
         f"| Merge Confidence (Renovate) | `{ctx.merge_confidence or 'unknown'}` | – | "
-        f"{'pass' if triage['merge_confidence_ok'] else 'fail'} (≥ `{triage['min_merge_confidence']}`) |"
-    )
-    if "fixable" in triage:
-        lines.append(
+        f"{'pass' if triage['merge_confidence_ok'] else 'fail'} (≥ `{triage['min_merge_confidence']}`) |",
+    ]
+    thr = pct(triage["threshold"])
+    if "category" in triage:
+        lines += [
+            f"| Failure Classification | `{triage['category']}` | {pct(triage['category_confidence'])} | "
+            f"{'pass' if triage['category_ok'] else 'fail'} (≥ {thr}, `API_BREAK`) |",
             f"| is_fixable | `{str(triage['fixable'] >= 0.5).lower()}` | {pct(triage['fixable'])} | "
-            f"{'pass' if triage['fixable'] >= triage['threshold'] else 'fail'} (≥ {pct(triage['threshold'])}) |"
-        )
+            f"{'pass' if triage['fixable'] >= triage['threshold'] else 'fail'} (≥ {thr}) |",
+        ]
+    else:
+        lines += [
+            "| Failure Classification | not evaluated | – | – |",
+            "| is_fixable | not evaluated | – | – |",
+        ]
     if analysis:
         lines += [
             "",
@@ -726,30 +715,14 @@ def remediate(args: argparse.Namespace) -> str:
         )
     log(f"branch={ctx.branch} bumps={bumps_text(ctx)} log={ctx.log_source}")
 
-    # Step 1: Jev classification
-    category, conf = jev_classify(ctx)
-    triage = {"category": category, "category_confidence": conf, "threshold": args.threshold,
-              "category_ok": category == "API_BREAK" and conf >= args.threshold,
-              "min_merge_confidence": args.min_merge_confidence,
-              "merge_confidence_ok": merge_confidence_ok(ctx.merge_confidence, args.min_merge_confidence)}
-    if not triage["category_ok"]:
-        triage["verification"] = "Skipped: classification gate not met; no code changes attempted."
-        outcome = "other" if category == "OTHER" else "human"
-        publish(ctx, render_report(ctx, outcome, triage, None), args)
-        return outcome
+    triage: dict[str, Any] = {
+        "threshold": args.threshold,
+        "min_merge_confidence": args.min_merge_confidence,
+        "merge_confidence_ok": merge_confidence_ok(ctx.merge_confidence, args.min_merge_confidence),
+    }
 
-    # Step 2: Claude root cause + proposed edits
-    analysis = claude_analyze(ctx)
-
-    # Step 3: Jev fixability
-    triage["fixable"] = jev_fixable(ctx, analysis) if analysis["edits"] else 0.0
-    if triage["fixable"] < args.threshold:
-        triage["verification"] = "Skipped: is_fixable gate not met; no code changes applied."
-        publish(ctx, render_report(ctx, "human", triage, analysis), args)
-        return "human"
-
-    # Step 4: Renovate Merge Confidence gate. The analysis above is reported either way; low
-    # confidence means the update itself may be at fault, so a person should decide.
+    # Gate 1: Renovate Merge Confidence (no model). Low confidence means the update itself may be
+    # at fault, so a person should decide.
     with TRACE.step("Merge Confidence gate", "Renovate") as step:
         step["merge_confidence"] = ctx.merge_confidence
         step["decision"] = (
@@ -758,13 +731,36 @@ def remediate(args: argparse.Namespace) -> str:
         )
     if not triage["merge_confidence_ok"]:
         triage["verification"] = (
-            f"Skipped: Renovate Merge Confidence is `{ctx.merge_confidence or 'unknown'}` "
-            f"(minimum `{args.min_merge_confidence}`); the proposed fix was not applied."
+            f"Stopped: Renovate Merge Confidence is `{ctx.merge_confidence or 'unknown'}` "
+            f"(minimum `{args.min_merge_confidence}`). No AI analysis was run and no code was changed."
         )
+        publish(ctx, render_report(ctx, "human", triage, None), args)
+        return "human"
+
+    # Gates 2 and 3: one Jev call for the failure classification and is_fixable.
+    category, conf, fixable = jev_triage(ctx)
+    triage.update(category=category, category_confidence=conf, fixable=fixable,
+                  category_ok=category == "API_BREAK" and conf >= args.threshold)
+    if not triage["category_ok"]:
+        triage["verification"] = ("Stopped: classification gate not met. Claude was not run and no code "
+                                  "was changed.")
+        outcome = "other" if category == "OTHER" else "human"
+        publish(ctx, render_report(ctx, outcome, triage, None), args)
+        return outcome
+    if fixable < args.threshold:
+        triage["verification"] = ("Stopped: is_fixable gate not met. Claude was not run and no code "
+                                  "was changed.")
+        publish(ctx, render_report(ctx, "human", triage, None), args)
+        return "human"
+
+    # All gates passed: Claude root cause + proposed edits.
+    analysis = claude_analyze(ctx)
+    if not analysis["edits"]:
+        triage["verification"] = "Claude proposed no edits; no code was changed."
         publish(ctx, render_report(ctx, "human", triage, analysis), args)
         return "human"
 
-    # Step 5: apply + verify (quality gate)
+    # Apply + verify (quality gate)
     with TRACE.step("Apply edits", "Script") as step:
         try:
             touched = apply_edits(analysis["edits"])
