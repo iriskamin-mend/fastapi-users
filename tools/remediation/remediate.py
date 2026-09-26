@@ -37,6 +37,8 @@ MAX_LOG_CHARS = 12_000
 MAX_NOTES_CHARS = 8_000
 MAX_DIFF_CHARS = 6_000
 COMMENT_MARKER = "<!-- agentic-remediation -->"
+CLAUDE_ATTEMPTS = 2  # a second attempt only when the first answer fails validation
+PLACEHOLDER_TEXT = {"", "test", "todo", "tbd", "placeholder", "n/a", "na", "none", "unknown", "..."}
 # Renovate Merge Confidence levels, lowest to highest.
 MERGE_CONFIDENCE_LEVELS = ["low", "neutral", "high", "very high"]
 # Renovate's PR description links a Merge Confidence badge for each update. The level is only
@@ -451,8 +453,8 @@ SYSTEM_PROMPT = (
 )
 
 
-def claude_analyze(ctx: Context) -> dict:
-    prompt = textwrap.dedent(f"""\
+def claude_prompt(ctx: Context) -> str:
+    return textwrap.dedent(f"""\
         A dependency update broke the test suite on branch `{ctx.branch}`.
 
         Dependency changes: {bumps_text(ctx)}
@@ -473,39 +475,102 @@ def claude_analyze(ctx: Context) -> dict:
         Find every usage in the repository affected by the breaking change (not only the one in
         the log) and propose the edits that fix it.
         """)
+
+
+def validate_analysis(analysis: dict) -> list[str]:
+    """Problems that make Claude's answer unusable; empty when it can be applied."""
+    problems = []
+    for key in ("root_cause", "fix_summary"):
+        text = str(analysis.get(key, "")).strip()
+        if text.lower().strip(".") in PLACEHOLDER_TEXT or len(text) < 20:
+            problems.append(f"`{key}` is empty or a placeholder ({text!r})")
+    edits = analysis.get("edits")
+    if not isinstance(edits, list) or not edits:
+        problems.append("`edits` is missing or empty")
+        return problems
+    for i, e in enumerate(edits, 1):
+        if not isinstance(e, dict) or not all(isinstance(e.get(k), str) for k in ("file", "old_string", "new_string")):
+            problems.append(f"edit {i} must have string fields file, old_string and new_string")
+            continue
+        path = Path(e["file"])
+        if path.name.startswith("requirements") or path.suffix in {".lock", ".toml"}:
+            problems.append(f"edit {i} changes dependency file `{path}`, which is not allowed")
+        elif path.as_posix().startswith("tools/remediation/"):
+            problems.append(f"edit {i} changes the remediation tooling (`{path}`), which is not allowed")
+        elif not path.is_file():
+            problems.append(f"edit {i}: file `{path}` does not exist")
+        elif e["old_string"] == e["new_string"]:
+            problems.append(f"edit {i} in `{path}` changes nothing")
+        else:
+            count = path.read_text(encoding="utf-8").count(e["old_string"])
+            if count != 1:
+                problems.append(f"edit {i}: old_string occurs {count} times in `{path}`, expected exactly once")
+    return problems
+
+
+def claude_analyze(ctx: Context) -> tuple[Optional[dict], list[str]]:
+    """Ask Claude for root cause and edits, validating each answer; retry once with the problems.
+
+    Returns (analysis, []) for a usable answer, or (None, problems of the last attempt).
+    """
+    base_prompt = claude_prompt(ctx)
+    problems: list[str] = []
+    for attempt in range(1, CLAUDE_ATTEMPTS + 1):
+        prompt = base_prompt
+        if problems:
+            prompt += ("\nYour previous answer was rejected for these reasons:\n"
+                       + "\n".join(f"- {p}" for p in problems)
+                       + "\nInvestigate again as needed and give a complete, valid answer in the required schema.\n")
+        name = "Root cause and fix" + (f" (attempt {attempt})" if attempt > 1 else "")
+        with TRACE.step(name, "Claude") as step:
+            analysis = claude_attempt(step, prompt)
+            problems = validate_analysis(analysis) if analysis else ["Claude returned no structured answer"]
+            step["validation"] = problems or "ok"
+            if problems:
+                step["decision"] = f"answer rejected: {'; '.join(problems)}"
+            else:
+                step["decision"] = (f"{len(analysis['edits'])} edit(s), self-reported confidence "
+                                    f"{float(analysis.get('confidence', 0)):.2f}")
+        if not problems:
+            return analysis, []
+        log(f"claude answer rejected (attempt {attempt}): {problems}")
+    return None, problems
+
+
+def claude_attempt(step: dict, prompt: str) -> Optional[dict]:
     cmd = [
         "claude", "-p", "--model", CLAUDE_MODEL, "--output-format", "stream-json", "--verbose",
         "--tools", "Read,Grep,Glob", "--system-prompt", SYSTEM_PROMPT,
         "--json-schema", json.dumps(ANALYSIS_SCHEMA), "--strict-mcp-config",
     ]
-    with TRACE.step("Root cause and fix", "Claude") as step:
-        step["request"] = {"model": CLAUDE_MODEL, "system_prompt": SYSTEM_PROMPT, "prompt": prompt}
-        log(f"asking Claude ({CLAUDE_MODEL}) for root cause and fix")
-        p = run(cmd, input=prompt, check=False)
-        transcript, result = parse_claude_stream(p.stdout)
-        step["transcript"] = transcript
-        if result is None:
-            raise RuntimeError(f"claude CLI returned no result:\n{p.stdout[-2000:]}\n{p.stderr[-2000:]}")
-        usage = result.get("usage") or {}
-        step.update(
-            model=", ".join((result.get("modelUsage") or {}).keys()) or CLAUDE_MODEL,
-            turns=result.get("num_turns"),
-            usage={
-                "input_tokens": usage.get("input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
-                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
-                "cost_usd": result.get("total_cost_usd", 0.0),
-            },
-        )
-        if result.get("is_error") or not result.get("structured_output"):
-            raise RuntimeError(f"claude CLI error: {result.get('result')}")
-        analysis = result["structured_output"]
-        step["answer"] = analysis
-        step["decision"] = f"{len(analysis['edits'])} edit(s), self-reported confidence {analysis['confidence']:.2f}"
-        log(f"claude cost=${result.get('total_cost_usd')} turns={result.get('num_turns')}")
+    step["request"] = {"model": CLAUDE_MODEL, "system_prompt": SYSTEM_PROMPT, "prompt": prompt}
+    log(f"asking Claude ({CLAUDE_MODEL}) for root cause and fix")
+    p = run(cmd, input=prompt, check=False)
+    transcript, result = parse_claude_stream(p.stdout)
+    step["transcript"] = transcript
+    if result is None:
+        step["cli_error"] = clip(p.stdout[-2000:] + "\n" + p.stderr[-2000:], 4000)
+        return None
+    usage = result.get("usage") or {}
+    step.update(
+        model=", ".join((result.get("modelUsage") or {}).keys()) or CLAUDE_MODEL,
+        turns=result.get("num_turns"),
+        usage={
+            "input_tokens": usage.get("input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+            "cost_usd": result.get("total_cost_usd", 0.0),
+        },
+    )
+    log(f"claude cost=${result.get('total_cost_usd')} turns={result.get('num_turns')}")
+    analysis = result.get("structured_output")
+    step["answer"] = analysis
+    if result.get("is_error") or not isinstance(analysis, dict):
+        step["cli_error"] = str(result.get("result"))[:2000]
+        return None
     return analysis
 
 
@@ -529,13 +594,16 @@ def parse_claude_stream(stdout: str) -> tuple[list[dict], Optional[dict]]:
                     transcript.append({"type": "note", "text": block["text"]})
                 elif btype == "thinking" and block.get("thinking", "").strip():
                     transcript.append({"type": "thinking", "text": block["thinking"]})
-                elif btype == "tool_use" and block.get("name") != "StructuredOutput":
+                elif btype == "tool_use" and block.get("name") == "StructuredOutput":
+                    transcript.append({"type": "answer_submitted",
+                                       "input": clip(json.dumps(block.get("input"), ensure_ascii=False), 3000)})
+                elif btype == "tool_use":
                     transcript.append({"type": "tool_call", "tool": block.get("name"), "input": block.get("input")})
                 elif btype == "tool_result":
                     body = block.get("content")
                     if isinstance(body, list):
                         body = "\n".join(b.get("text", "") for b in body if isinstance(b, dict))
-                    if body and "Structured output provided" not in str(body):
+                    if body and "Structured output provided successfully" not in str(body):
                         transcript.append({"type": "tool_result", "content": clip(str(body), 3000)})
     return transcript, result
 
@@ -754,10 +822,13 @@ def remediate(args: argparse.Namespace) -> str:
         return "human"
 
     # All gates passed: Claude root cause + proposed edits.
-    analysis = claude_analyze(ctx)
-    if not analysis["edits"]:
-        triage["verification"] = "Claude proposed no edits; no code was changed."
-        publish(ctx, render_report(ctx, "human", triage, analysis), args)
+    analysis, problems = claude_analyze(ctx)
+    if analysis is None:
+        triage["verification"] = (
+            f"Claude couldn't produce a valid fix in {CLAUDE_ATTEMPTS} attempts, so no code was changed. "
+            "Last problems: " + "; ".join(problems) + "."
+        )
+        publish(ctx, render_report(ctx, "human", triage, None), args)
         return "human"
 
     # Apply + verify (quality gate)
